@@ -12,13 +12,13 @@ use tokio::{
 
 #[derive(Debug)]
 struct DeploymentJob {
-    id: i64,
-    deployment_id: i64,
+    id: i32,
+    deployment_id: i32,
 }
 
 #[derive(Debug)]
 struct DeploymentContext {
-    project_id: i64,
+    project_id: i32,
     project_name: String,
     repo_url: String,
     branch: String,
@@ -225,7 +225,7 @@ async fn process_deployment(
     Ok(())
 }
 
-async fn get_deployment_context(pool: &PgPool, deployment_id: i64) -> Result<DeploymentContext> {
+async fn get_deployment_context(pool: &PgPool, deployment_id: i32) -> Result<DeploymentContext> {
     let row = sqlx::query(
         r#"
         SELECT p.id AS project_id, p.name AS project_name, p.repo_url, p.branch, p.app_type
@@ -281,7 +281,7 @@ async fn prepare_build_context(workspace: &Path, app_type: &str) -> Result<Optio
 async fn configure_caddy(
     client: &Client,
     config: &Config,
-    project_id: i64,
+    project_id: i32,
     hostname: &str,
     port: u16,
 ) -> Result<()> {
@@ -327,7 +327,7 @@ async fn configure_caddy(
 
 async fn run_logged(
     pool: &PgPool,
-    deployment_id: i64,
+    deployment_id: i32,
     program: &str,
     args: &[&str],
 ) -> Result<String> {
@@ -406,7 +406,7 @@ async fn mark_job_failed(pool: &PgPool, job: &DeploymentJob, message: &str) -> R
     Ok(())
 }
 
-async fn insert_log(pool: &PgPool, deployment_id: i64, message: &str) -> Result<()> {
+async fn insert_log(pool: &PgPool, deployment_id: i32, message: &str) -> Result<()> {
     sqlx::query("INSERT INTO deployment_logs (deployment_id, message) VALUES ($1, $2)")
         .bind(deployment_id)
         .bind(message)
@@ -417,7 +417,7 @@ async fn insert_log(pool: &PgPool, deployment_id: i64, message: &str) -> Result<
 
 async fn insert_log_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    deployment_id: i64,
+    deployment_id: i32,
     message: &str,
 ) -> Result<()> {
     sqlx::query("INSERT INTO deployment_logs (deployment_id, message) VALUES ($1, $2)")
