@@ -322,7 +322,7 @@ async fn process_delete_deployment(
 async fn get_database_config(pool: &PgPool, project_id: i32) -> Result<Option<DatabaseConfig>> {
     let row = sqlx::query(
         r#"
-        SELECT engine, db_name, db_user, db_password, container_name, internal_host, port
+        SELECT engine::text AS engine, db_name, db_user, db_password, container_name, internal_host, port
         FROM project_databases
         WHERE project_id = $1
         "#,
@@ -494,7 +494,7 @@ async fn run_migrations(
 }
 
 async fn update_database_status(pool: &PgPool, project_id: i32, status: &str) -> Result<()> {
-    sqlx::query("UPDATE project_databases SET status = $1 WHERE project_id = $2")
+    sqlx::query("UPDATE project_databases SET status = $1::db_status WHERE project_id = $2")
         .bind(status)
         .bind(project_id)
         .execute(pool)
