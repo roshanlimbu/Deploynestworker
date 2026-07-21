@@ -26,6 +26,17 @@ struct DeploymentContext {
     app_type: String,
 }
 
+#[derive(Debug)]
+struct DatabaseConfig {
+    engine: String,
+    db_name: String,
+    db_user: String,
+    db_password: String,
+    container_name: String,
+    internal_host: String,
+    port: i32,
+}
+
 struct Config {
     workspace_dir: String,
     container_port: u16,
@@ -56,6 +67,8 @@ impl Config {
     }
 }
 
+const DOCKER_NETWORK: &str = "deploynest-net";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
@@ -66,6 +79,7 @@ async fn main() -> Result<()> {
     let poll_interval = env_or("POLL_INTERVAL_SECONDS", "5").parse()?;
 
     fs::create_dir_all(&config.workspace_dir).await?;
+    ensure_docker_network().await?;
     println!("DeployNest worker started");
 
     loop {
@@ -146,6 +160,7 @@ async fn process_deployment(
     job: &DeploymentJob,
 ) -> Result<()> {
     let deployment = get_deployment_context(pool, job.deployment_id).await?;
+    let db_config = get_database_config(pool, deployment.project_id).await?;
     let workspace =
         Path::new(&config.workspace_dir).join(format!("deployment-{}", job.deployment_id));
     let image = format!(
@@ -188,31 +203,66 @@ async fn process_deployment(
     build_args.push(workspace_path);
     run_logged(pool, job.deployment_id, "docker", &build_args).await?;
 
+    // If a database is configured, ensure the database container is running
+    if let Some(ref db_cfg) = db_config {
+        insert_log(pool, job.deployment_id, &format!(
+            "[DATABASE] Ensuring {} container '{}' is running...",
+            db_cfg.engine, db_cfg.container_name
+        )).await?;
+        ensure_database_container(pool, job.deployment_id, db_cfg).await?;
+        update_database_status(pool, deployment.project_id, "running").await?;
+    }
+
     let host_port = available_port(config.port_start, config.port_end)?;
     let port_mapping = format!("{host_port}:{}", config.container_port);
     let project_label = format!("deploynest.project_id={}", deployment.project_id);
-    let output = run_logged(
-        pool,
-        job.deployment_id,
-        "docker",
-        &[
-            "run",
-            "-d",
-            "--restart",
-            "unless-stopped",
-            "--name",
-            &container_name,
-            "--label",
-            &project_label,
-            "-p",
-            &port_mapping,
-            &image,
-        ],
-    )
-    .await?;
+
+    // Build docker run args, injecting DB env vars if configured
+    let mut run_args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--restart".into(),
+        "unless-stopped".into(),
+        "--name".into(),
+        container_name.clone(),
+        "--label".into(),
+        project_label.clone(),
+        "--network".into(),
+        DOCKER_NETWORK.into(),
+        "-p".into(),
+        port_mapping,
+    ];
+
+    if let Some(ref db_cfg) = db_config {
+        let db_connection = match db_cfg.engine.as_str() {
+            "mysql" => "mysql",
+            "postgresql" => "pgsql",
+            _ => "mysql",
+        };
+        run_args.extend([
+            "-e".into(), format!("DB_CONNECTION={db_connection}"),
+            "-e".into(), format!("DB_HOST={}", db_cfg.internal_host),
+            "-e".into(), format!("DB_PORT={}", db_cfg.port),
+            "-e".into(), format!("DB_DATABASE={}", db_cfg.db_name),
+            "-e".into(), format!("DB_USERNAME={}", db_cfg.db_user),
+            "-e".into(), format!("DB_PASSWORD={}", db_cfg.db_password),
+        ]);
+    }
+
+    run_args.push(image);
+
+    let run_args_refs: Vec<&str> = run_args.iter().map(|s| s.as_str()).collect();
+    let output = run_logged(pool, job.deployment_id, "docker", &run_args_refs).await?;
     let container_id = output.trim().to_string();
     if container_id.is_empty() {
         bail!("Docker did not return a container ID");
+    }
+
+    // Run Laravel migrations if database is configured and app is Laravel
+    if db_config.is_some() && deployment.app_type == "laravel" {
+        insert_log(pool, job.deployment_id, "[DATABASE] Waiting for database to be ready...").await?;
+        sleep(Duration::from_secs(10)).await;
+        run_migrations(pool, job.deployment_id, &container_name).await?;
     }
 
     let hostname = format!(
@@ -238,19 +288,15 @@ async fn process_deployment(
 
 async fn process_delete_deployment(
     pool: &PgPool,
-    client: &Client,
-    config: &Config,
+    _client: &Client,
+    _config: &Config,
     job: &DeploymentJob,
 ) -> Result<()> {
     let deployment = get_deployment_context(pool, job.deployment_id).await?;
     let container_name = format!("deploynest-{}-{}", deployment.project_id, job.deployment_id);
 
-    // Stop and remove the container
+    // Stop and remove the app container
     let _ = remove_container(&container_name).await;
-
-    // Check if this was the active deployment (if so, we should remove the caddy route, but 
-    // for simplicity, we just delete the container, and if they delete the project, the Caddy route
-    // will be orphaned which is harmless, or we can delete it if we had a delete_project job).
 
     // Delete the deployment from the database completely
     let mut transaction = pool.begin().await?;
@@ -270,6 +316,193 @@ async fn process_delete_deployment(
 
     Ok(())
 }
+
+// ── Database provisioning ─────────────────────────────────────────────
+
+async fn get_database_config(pool: &PgPool, project_id: i32) -> Result<Option<DatabaseConfig>> {
+    let row = sqlx::query(
+        r#"
+        SELECT engine, db_name, db_user, db_password, container_name, internal_host, port
+        FROM project_databases
+        WHERE project_id = $1
+        "#,
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| DatabaseConfig {
+        engine: r.get("engine"),
+        db_name: r.get("db_name"),
+        db_user: r.get("db_user"),
+        db_password: r.get("db_password"),
+        container_name: r.get::<String, _>("container_name"),
+        internal_host: r.get::<String, _>("internal_host"),
+        port: r.get("port"),
+    }))
+}
+
+async fn ensure_docker_network() -> Result<()> {
+    let output = Command::new("docker")
+        .args(["network", "ls", "--filter", &format!("name=^{DOCKER_NETWORK}$"), "--format", "{{.Name}}"])
+        .output()
+        .await?;
+
+    let existing = String::from_utf8_lossy(&output.stdout);
+    if existing.trim().is_empty() {
+        println!("Creating Docker network: {DOCKER_NETWORK}");
+        let status = Command::new("docker")
+            .args(["network", "create", DOCKER_NETWORK])
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("Failed to create Docker network {DOCKER_NETWORK}");
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_database_container(
+    pool: &PgPool,
+    deployment_id: i32,
+    db_cfg: &DatabaseConfig,
+) -> Result<()> {
+    // Check if the database container is already running
+    let output = Command::new("docker")
+        .args(["ps", "-q", "--filter", &format!("name=^{}$", db_cfg.container_name)])
+        .output()
+        .await?;
+
+    if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        insert_log(pool, deployment_id, &format!(
+            "[DATABASE] Container '{}' is already running",
+            db_cfg.container_name
+        )).await?;
+
+        // Make sure it's connected to the network
+        let _ = Command::new("docker")
+            .args(["network", "connect", DOCKER_NETWORK, &db_cfg.container_name])
+            .output()
+            .await;
+
+        return Ok(());
+    }
+
+    // Check if the container exists but is stopped
+    let output = Command::new("docker")
+        .args(["ps", "-aq", "--filter", &format!("name=^{}$", db_cfg.container_name)])
+        .output()
+        .await?;
+
+    if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        insert_log(pool, deployment_id, &format!(
+            "[DATABASE] Starting existing container '{}'...",
+            db_cfg.container_name
+        )).await?;
+        let status = Command::new("docker")
+            .args(["start", &db_cfg.container_name])
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("Failed to start database container {}", db_cfg.container_name);
+        }
+        return Ok(());
+    }
+
+    // Container doesn't exist, create it
+    insert_log(pool, deployment_id, &format!(
+        "[DATABASE] Creating new {} container '{}'...",
+        db_cfg.engine, db_cfg.container_name
+    )).await?;
+
+    let volume_name = format!("{}-data", db_cfg.container_name);
+
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--restart".into(),
+        "unless-stopped".into(),
+        "--name".into(),
+        db_cfg.container_name.clone(),
+        "--network".into(),
+        DOCKER_NETWORK.into(),
+        "-v".into(),
+        format!("{volume_name}:/var/lib/{}", if db_cfg.engine == "mysql" { "mysql" } else { "postgresql/data" }),
+    ];
+
+    match db_cfg.engine.as_str() {
+        "mysql" => {
+            args.extend([
+                "-e".into(), format!("MYSQL_ROOT_PASSWORD={}", db_cfg.db_password),
+                "-e".into(), format!("MYSQL_DATABASE={}", db_cfg.db_name),
+                "-e".into(), format!("MYSQL_USER={}", db_cfg.db_user),
+                "-e".into(), format!("MYSQL_PASSWORD={}", db_cfg.db_password),
+                "mysql:8".into(),
+            ]);
+        }
+        "postgresql" => {
+            args.extend([
+                "-e".into(), format!("POSTGRES_DB={}", db_cfg.db_name),
+                "-e".into(), format!("POSTGRES_USER={}", db_cfg.db_user),
+                "-e".into(), format!("POSTGRES_PASSWORD={}", db_cfg.db_password),
+                "postgres:16".into(),
+            ]);
+        }
+        other => bail!("Unsupported database engine: {other}"),
+    }
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_logged(pool, deployment_id, "docker", &args_refs).await?;
+
+    insert_log(pool, deployment_id, &format!(
+        "[DATABASE] {} container '{}' started successfully",
+        db_cfg.engine, db_cfg.container_name
+    )).await?;
+
+    Ok(())
+}
+
+async fn run_migrations(
+    pool: &PgPool,
+    deployment_id: i32,
+    container_name: &str,
+) -> Result<()> {
+    insert_log(pool, deployment_id, "[DATABASE] Running Laravel migrations...").await?;
+
+    let output = Command::new("docker")
+        .args(["exec", container_name, "php", "artisan", "migrate", "--force"])
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !stdout.trim().is_empty() {
+        insert_log(pool, deployment_id, &stdout).await?;
+    }
+    if !stderr.trim().is_empty() {
+        insert_log(pool, deployment_id, &stderr).await?;
+    }
+
+    if output.status.success() {
+        insert_log(pool, deployment_id, "[DATABASE] Migrations completed successfully").await?;
+    } else {
+        insert_log(pool, deployment_id, "[DATABASE] Migration failed (non-fatal, app container still running)").await?;
+    }
+
+    Ok(())
+}
+
+async fn update_database_status(pool: &PgPool, project_id: i32, status: &str) -> Result<()> {
+    sqlx::query("UPDATE project_databases SET status = $1 WHERE project_id = $2")
+        .bind(status)
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ── Existing helpers ──────────────────────────────────────────────────
 
 async fn get_deployment_context(pool: &PgPool, deployment_id: i32) -> Result<DeploymentContext> {
     let row = sqlx::query(

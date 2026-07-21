@@ -11,7 +11,15 @@ services:
       - caddy_config:/config
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - deploynest-net
+      - default
 
 volumes:
   caddy_data:
   caddy_config:
+
+networks:
+  deploynest-net:
+    name: deploynest-net
+    external: true
