@@ -331,30 +331,59 @@ async fn run_logged(
     program: &str,
     args: &[&str],
 ) -> Result<String> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
     let command_summary = if program == "git" && args.first() == Some(&"clone") {
         "git clone [repository]".to_string()
     } else {
         format!("{program} {}", args.join(" "))
     };
     insert_log(pool, deployment_id, &format!("[COMMAND] {command_summary}")).await?;
-    let output = Command::new(program)
+
+    let mut child = Command::new(program)
         .args(args)
-        .output()
-        .await
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("Failed to start {program}"))?;
 
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        insert_log(pool, deployment_id, line).await?;
-    }
-    for line in String::from_utf8_lossy(&output.stderr).lines() {
-        insert_log(pool, deployment_id, line).await?;
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let stderr = child.stderr.take().expect("Failed to open stderr");
+
+    let pool_clone1 = pool.clone();
+    let pool_clone2 = pool.clone();
+
+    let full_stdout = Arc::new(Mutex::new(String::new()));
+    let full_stdout_clone = full_stdout.clone();
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            full_stdout_clone.lock().await.push_str(&format!("{line}\n"));
+            let _ = insert_log(&pool_clone1, deployment_id, &line).await;
+        }
+    });
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let _ = insert_log(&pool_clone2, deployment_id, &line).await;
+        }
+    });
+
+    let status = child.wait().await?;
+    let _ = stdout_handle.await;
+    let _ = stderr_handle.await;
+
+    if !status.success() {
+        bail!("{program} exited with {}", status);
     }
 
-    if !output.status.success() {
-        bail!("{program} exited with {}", output.status);
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let final_stdout = full_stdout.lock().await.clone();
+    Ok(final_stdout)
 }
 
 fn available_port(start: u16, end: u16) -> Result<u16> {
