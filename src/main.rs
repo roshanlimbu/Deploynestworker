@@ -470,7 +470,7 @@ async fn run_migrations(
     insert_log(pool, deployment_id, "[DATABASE] Running Laravel migrations...").await?;
 
     let output = Command::new("docker")
-        .args(["exec", container_name, "php", "artisan", "migrate", "--force"])
+        .args(["exec", "-u", "www-data", container_name, "php", "artisan", "migrate", "--force"])
         .output()
         .await?;
 
